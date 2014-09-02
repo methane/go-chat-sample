@@ -33,11 +33,12 @@ func newRoom() *Room {
 				log.Printf("Room: %v is joined", c)
 				r.clients[c] = true
 			case c := <-r.Closed: // c は停止済み.
+				log.Printf("Room: %v has been closed", c)
 				if r.clients[c] {
 					delete(r.clients, c)
-					log.Printf("Room: %v has been closed", c)
 				}
 			case msg := <-r.Recv:
+				//log.Printf("Room: Received %#v", msg)
 				for c := range r.clients {
 					if err := c.Send(msg); err != nil {
 						// 接続しただけで受信しない攻撃でバッファ食いつぶさないように、
@@ -47,7 +48,6 @@ func newRoom() *Room {
 						delete(r.clients, c)
 					}
 				}
-				log.Printf("Room: Received %#v", msg)
 			}
 		}
 	}()
@@ -55,11 +55,12 @@ func newRoom() *Room {
 }
 
 type Client struct {
-	id   int
-	recv chan string
-	send chan string
-	stop chan bool
-	conn *net.TCPConn
+	id     int
+	recv   chan string
+	closed chan *Client
+	send   chan string
+	stop   chan bool
+	conn   *net.TCPConn
 }
 
 func (c *Client) String() string {
@@ -72,8 +73,9 @@ var lastClientId = 0
 func newClient(r *Room, conn *net.TCPConn) *Client {
 	lastClientId++
 	cl := &Client{
-		id:   lastClientId,
-		recv: r.Recv,
+		id:     lastClientId,
+		recv:   r.Recv,
+		closed: r.Closed,
 		// クライアントは一時的に接続が不安定になるかもしれないのでバッファ多め
 		send: make(chan string, 50),
 		stop: make(chan bool),
@@ -81,7 +83,7 @@ func newClient(r *Room, conn *net.TCPConn) *Client {
 	}
 	go cl.sender()
 	go cl.receiver()
-	log.Print("%v created", cl)
+	log.Printf("%v is created", cl)
 	return cl
 }
 
@@ -100,8 +102,7 @@ func (c *Client) Send(msg string) error {
 func (c *Client) Stop() {
 	// defer recover() ではダメ
 	defer func() {
-		r := recover()
-		if r != nil {
+		if r := recover(); r != nil {
 			log.Println(r)
 		}
 	}()
@@ -109,7 +110,12 @@ func (c *Client) Stop() {
 }
 
 func (c *Client) sender() {
-	defer c.conn.Close()
+	defer func() {
+		if err := c.conn.Close(); err != nil {
+			log.Println(err)
+		}
+		c.closed <- c
+	}()
 	for {
 		select {
 		case <-c.stop:
