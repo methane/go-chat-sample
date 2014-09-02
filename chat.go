@@ -40,6 +40,7 @@ func newRoom() *Room {
 			case msg := <-r.Recv:
 				for c := range r.clients {
 					if err := c.Send(msg); err != nil {
+						// 接続しただけで受信しない攻撃でバッファ食いつぶさないように、
 						// 受信が詰まったクライアントは止める.
 						log.Println(err)
 						c.Stop()
@@ -69,7 +70,7 @@ var lastClientId = 0
 
 // lastClientId のせいでスレッドセーフじゃないよごめん
 func newClient(r *Room, conn *net.TCPConn) *Client {
-	lastClientId += 1
+	lastClientId++
 	cl := &Client{
 		id:   lastClientId,
 		recv: r.Recv,
