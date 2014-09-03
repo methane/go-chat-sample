@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"syscall"
 	"time"
 )
 
@@ -38,9 +39,8 @@ func newRoom() *Room {
 				r.clients[c] = true
 			case c := <-r.Closed: // c は停止済み.
 				log.Printf("Room: %v has been closed", c)
-				if r.clients[c] {
-					delete(r.clients, c)
-				}
+				// delete は指定されたキーが無かったら何もしない
+				delete(r.clients, c)
 			case msg := <-r.Recv:
 				//log.Printf("Room: Received %#v", msg)
 				for c := range r.clients {
@@ -56,6 +56,7 @@ func newRoom() *Room {
 				log.Printf("Purge all clients")
 				for c := range r.clients {
 					c.Stop()
+					// Go の map はイテレート中にキーの削除ができる.
 					delete(r.clients, c)
 				}
 			}
@@ -74,13 +75,14 @@ type Client struct {
 }
 
 func (c *Client) String() string {
+	// ログに書くオブジェクトには String() を実装しよう.
 	return fmt.Sprintf("Client(%v)", c.id)
 }
 
 var lastClientId = 0
 
-// lastClientId のせいでスレッドセーフじゃないよごめん
 func newClient(r *Room, conn *net.TCPConn) *Client {
+	// lastClientId のせいでこの関数はスレッドセーフじゃないよごめん
 	lastClientId++
 	cl := &Client{
 		id:     lastClientId,
@@ -102,7 +104,10 @@ func (c *Client) Send(msg string) error {
 	select {
 	case c.send <- msg:
 		return nil
-	// room goroutine が速すぎて send が間に合ってないだけかもしれないので、少しは待つ
+	// 特定のクライアントが遅いときに、全体を遅くしたくないので、 select を使って
+	// すぐに送信できない場合は諦める。
+	// ただし、 room goroutine が sender goroutine より速く回ってるためにチャンネルの
+	// バッファがいっぱいになってるだけの可能性もあるので、一定時間は待つ.
 	case <-time.After(time.Millisecond * 10):
 		return errors.New("Can't send to client")
 	}
@@ -110,7 +115,10 @@ func (c *Client) Send(msg string) error {
 
 // Stop closes client.  It can be called multiple times.
 func (c *Client) Stop() {
-	// defer recover() ではダメ
+	// 1つのチャンネルで複数の goroutine を止められるように、メッセージ送信じゃなくて
+	// close を使う。
+	// (このサンプルプログラムでは stop 受信してるのは1箇所だけなのでメッセージ送信でも可)
+	// ちなみに defer recover() ではダメ
 	defer func() {
 		if r := recover(); r != nil {
 			log.Println(r)
@@ -147,7 +155,7 @@ func (c *Client) sender() {
 
 func (c *Client) receiver() {
 	defer c.Stop() // receiver が止まるときはかならず全体を止める.
-	reader := bufio.NewReader(c.conn)
+	reader := bufio.NewReaderSize(c.conn, 512)
 	for {
 		// Read() する goroutine を中断するのは難しい。
 		// 外側で conn.Close() して、エラーで死ぬのが楽.
@@ -166,6 +174,7 @@ func (c *Client) receiver() {
 
 func main() {
 	log.SetFlags(log.Lmicroseconds | log.Lshortfile)
+	log.Println("PID: ", os.Getpid())
 	room := newRoom()
 
 	addr, err := net.ResolveTCPAddr("tcp", "0.0.0.0:5056")
@@ -190,7 +199,7 @@ func main() {
 	}()
 
 	sigint := make(chan os.Signal, 1)
-	signal.Notify(sigint, os.Interrupt)
+	signal.Notify(sigint, os.Signal(syscall.SIGUSR1))
 	for _ = range sigint {
 		room.Purge <- true
 	}
