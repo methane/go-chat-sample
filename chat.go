@@ -20,7 +20,7 @@ type Room struct {
 	// unbuffered chan を使って入力を制限する.
 	Recv  chan string // received message from clients.
 	Purge chan bool
-	Stop  chan chan bool
+	Stop  chan bool
 	// slice の resize コストが接続数に比例して増えるのを防ぐため map を使う.
 	clients map[*Client]bool
 	log     []string
@@ -32,7 +32,7 @@ func newRoom() *Room {
 		Closed:  make(chan *Client),
 		Recv:    make(chan string),
 		Purge:   make(chan bool),
-		Stop:    make(chan chan bool),
+		Stop:    make(chan bool),
 		clients: make(map[*Client]bool),
 	}
 	go r.run()
@@ -72,10 +72,9 @@ func (r *Room) run() {
 		case <-r.Purge:
 			log.Printf("Purge all clients")
 			r.purge()
-		case rc := <-r.Stop:
+		case <-r.Stop:
 			log.Println("Closing room...")
 			r.purge()
-			rc <- true
 			return
 		}
 	}
@@ -256,10 +255,7 @@ func main() {
 		case syscall.SIGUSR1:
 			room.Purge <- true
 		case syscall.SIGTERM, os.Interrupt:
-			rc := make(chan bool)
-			room.Stop <- rc
-			// room の終了処理を待つ.
-			<-rc
+			room.Stop <- true
 			// 全ての client の sender を待つ
 			clientWait.Wait()
 			// おわり
