@@ -119,15 +119,21 @@ func newClient(r *Room, conn *net.TCPConn) *Client {
 
 // Send msg to the client.
 func (c *Client) Send(msg string) error {
-	select {
-	case c.send <- msg:
-		return nil
 	// 特定のクライアントが遅いときに、全体を遅くしたくないので、 select を使って
 	// すぐに送信できない場合は諦める。
 	// ただし、 room goroutine が sender goroutine より速く回ってるためにチャンネルの
 	// バッファがいっぱいになってるだけの可能性もあるので、一定時間は待つ.
-	case <-time.After(time.Millisecond * 10):
-		return errors.New("Can't send to client")
+	// バッファに空きがあるときに時に time.After を生成するのは無駄なので、 select を2段にする.
+	select {
+	case c.send <- msg:
+		return nil
+	default:
+		select {
+		case c.send <- msg:
+			return nil
+		case <-time.After(time.Millisecond * 10):
+			return errors.New("Can't send to client")
+		}
 	}
 }
 
