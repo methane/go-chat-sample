@@ -8,9 +8,12 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 )
+
+var SigUSR1 os.Signal = syscall.SIGUSR1
 
 type Room struct {
 	Join   chan *Client
@@ -19,6 +22,7 @@ type Room struct {
 	// unbuffered chan を使って入力を制限する.
 	Recv  chan string // received message from clients.
 	Purge chan bool
+	Stop  chan chan bool
 	// slice の resize コストが接続数に比例して増えるのを防ぐため map を使う.
 	clients map[*Client]bool
 }
@@ -29,40 +33,52 @@ func newRoom() *Room {
 		Closed:  make(chan *Client),
 		Recv:    make(chan string),
 		Purge:   make(chan bool),
+		Stop:    make(chan chan bool),
 		clients: make(map[*Client]bool),
 	}
-	go func() {
-		for {
-			select {
-			case c := <-r.Join:
-				log.Printf("Room: %v is joined", c)
-				r.clients[c] = true
-			case c := <-r.Closed: // c は停止済み.
-				log.Printf("Room: %v has been closed", c)
-				// delete は指定されたキーが無かったら何もしない
-				delete(r.clients, c)
-			case msg := <-r.Recv:
-				//log.Printf("Room: Received %#v", msg)
-				for c := range r.clients {
-					if err := c.Send(msg); err != nil {
-						// 接続しただけで受信しない攻撃でバッファ食いつぶさないように、
-						// 受信が詰まったクライアントは止める.
-						log.Println(err)
-						c.Stop()
-						delete(r.clients, c)
-					}
-				}
-			case <-r.Purge:
-				log.Printf("Purge all clients")
-				for c := range r.clients {
+	go r.run()
+	return r
+}
+
+func (r *Room) run() {
+	defer log.Println("Room closed.")
+	for {
+		select {
+		case c := <-r.Join:
+			log.Printf("Room: %v is joined", c)
+			r.clients[c] = true
+		case c := <-r.Closed: // c は停止済み.
+			log.Printf("Room: %v has been closed", c)
+			// delete は指定されたキーが無かったら何もしない
+			delete(r.clients, c)
+		case msg := <-r.Recv:
+			//log.Printf("Room: Received %#v", msg)
+			for c := range r.clients {
+				if err := c.Send(msg); err != nil {
+					// 接続しただけで受信しない攻撃でバッファ食いつぶさないように、
+					// 受信が詰まったクライアントは止める.
+					log.Println(err)
 					c.Stop()
-					// Go の map はイテレート中にキーの削除ができる.
 					delete(r.clients, c)
 				}
 			}
+		case <-r.Purge:
+			log.Printf("Purge all clients")
+			r.purge()
+		case rc := <-r.Stop:
+			log.Println("Closing room...")
+			r.purge()
+			rc <- true
+			return
 		}
-	}()
-	return r
+	}
+}
+
+func (r *Room) purge() {
+	for c := range r.clients {
+		c.Stop()
+		delete(r.clients, c)
+	}
 }
 
 type Client struct {
@@ -80,6 +96,7 @@ func (c *Client) String() string {
 }
 
 var lastClientId = 0
+var clientWait sync.WaitGroup
 
 func newClient(r *Room, conn *net.TCPConn) *Client {
 	// lastClientId のせいでこの関数はスレッドセーフじゃないよごめん
@@ -93,6 +110,7 @@ func newClient(r *Room, conn *net.TCPConn) *Client {
 		stop: make(chan bool),
 		conn: conn,
 	}
+	clientWait.Add(1) // receiver の終了を待つ必要は特にないので sender 分だけ Add
 	go cl.sender()
 	go cl.receiver()
 	log.Printf("%v is created", cl)
@@ -132,6 +150,8 @@ func (c *Client) sender() {
 		if err := c.conn.Close(); err != nil {
 			log.Println(err)
 		}
+		log.Printf("%v is closed", c)
+		clientWait.Done()
 		c.closed <- c
 	}()
 	for {
@@ -199,8 +219,20 @@ func main() {
 	}()
 
 	sigint := make(chan os.Signal, 1)
-	signal.Notify(sigint, os.Signal(syscall.SIGUSR1))
-	for _ = range sigint {
-		room.Purge <- true
+	signal.Notify(sigint, SigUSR1, os.Kill, os.Interrupt)
+	for sig := range sigint {
+		switch sig {
+		case SigUSR1:
+			room.Purge <- true
+		case os.Kill, os.Interrupt:
+			rc := make(chan bool)
+			room.Stop <- rc
+			// room の終了処理を待つ.
+			<-rc
+			// 全ての client の sender を待つ
+			clientWait.Wait()
+			// おわり
+			return
+		}
 	}
 }
