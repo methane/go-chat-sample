@@ -179,6 +179,7 @@ func (c *Client) sender() {
 
 func (c *Client) receiver() {
 	defer c.Stop() // receiver が止まるときはかならず全体を止める.
+	// 1行を512byteに制限する.
 	reader := bufio.NewReaderSize(c.conn, 512)
 	for {
 		// Read() する goroutine を中断するのは難しい。
