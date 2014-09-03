@@ -23,6 +23,7 @@ type Room struct {
 	Stop  chan chan bool
 	// slice の resize コストが接続数に比例して増えるのを防ぐため map を使う.
 	clients map[*Client]bool
+	log     []string
 }
 
 func newRoom() *Room {
@@ -38,19 +39,27 @@ func newRoom() *Room {
 	return r
 }
 
+const CHAT_LOG_LENGTH = 100
+
 func (r *Room) run() {
 	defer log.Println("Room closed.")
 	for {
 		select {
 		case c := <-r.Join:
 			log.Printf("Room: %v is joined", c)
-			r.clients[c] = true
+			if err := r.sendLog(c); err != nil {
+				log.Println(err)
+				c.Stop()
+			} else {
+				r.clients[c] = true
+			}
 		case c := <-r.Closed: // c は停止済み.
 			log.Printf("Room: %v has been closed", c)
 			// delete は指定されたキーが無かったら何もしない
 			delete(r.clients, c)
 		case msg := <-r.Recv:
 			//log.Printf("Room: Received %#v", msg)
+			r.appendLog(msg)
 			for c := range r.clients {
 				if err := c.Send(msg); err != nil {
 					// 接続しただけで受信しない攻撃でバッファ食いつぶさないように、
@@ -70,6 +79,23 @@ func (r *Room) run() {
 			return
 		}
 	}
+}
+
+func (r *Room) appendLog(msg string) {
+	r.log = append(r.log, msg)
+	if len(r.log) > CHAT_LOG_LENGTH {
+		r.log = r.log[len(r.log)-CHAT_LOG_LENGTH:]
+	}
+}
+
+// sendLog sends chat log.
+func (r *Room) sendLog(c *Client) error {
+	for _, msg := range r.log {
+		if err := c.Send(msg); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (r *Room) purge() {
@@ -227,7 +253,7 @@ func main() {
 	signal.Notify(sigc, syscall.SIGUSR1, os.Kill, os.Interrupt)
 	for sig := range sigc {
 		switch sig {
-		case SigUSR1:
+		case syscall.SIGUSR1:
 			room.Purge <- true
 		case os.Kill, os.Interrupt:
 			rc := make(chan bool)
