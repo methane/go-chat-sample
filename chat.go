@@ -250,12 +250,12 @@ func main() {
 	}()
 
 	sigc := make(chan os.Signal, 1)
-	signal.Notify(sigc, syscall.SIGUSR1, os.Kill, os.Interrupt)
+	signal.Notify(sigc, syscall.SIGUSR1, syscall.SIGTERM, os.Interrupt)
 	for sig := range sigc {
 		switch sig {
 		case syscall.SIGUSR1:
 			room.Purge <- true
-		case os.Kill, os.Interrupt:
+		case syscall.SIGTERM, os.Interrupt:
 			rc := make(chan bool)
 			room.Stop <- rc
 			// room の終了処理を待つ.
