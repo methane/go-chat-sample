@@ -13,8 +13,6 @@ import (
 	"time"
 )
 
-var SigUSR1 os.Signal = syscall.SIGUSR1
-
 type Room struct {
 	Join   chan *Client
 	Closed chan *Client
@@ -224,9 +222,9 @@ func main() {
 		}
 	}()
 
-	sigint := make(chan os.Signal, 1)
-	signal.Notify(sigint, SigUSR1, os.Kill, os.Interrupt)
-	for sig := range sigint {
+	sigc := make(chan os.Signal, 1)
+	signal.Notify(sigc, syscall.SIGUSR1, os.Kill, os.Interrupt)
+	for sig := range sigc {
 		switch sig {
 		case SigUSR1:
 			room.Purge <- true
