@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
+	"os/signal"
 	"time"
 )
 
@@ -14,7 +16,8 @@ type Room struct {
 	Closed chan *Client
 	// reader をスムースに動かしても room や sender が間に合わないと仕方がない.
 	// unbuffered chan を使って入力を制限する.
-	Recv chan string // received message from clients.
+	Recv  chan string // received message from clients.
+	Purge chan bool
 	// slice の resize コストが接続数に比例して増えるのを防ぐため map を使う.
 	clients map[*Client]bool
 }
@@ -24,6 +27,7 @@ func newRoom() *Room {
 		Join:    make(chan *Client),
 		Closed:  make(chan *Client),
 		Recv:    make(chan string),
+		Purge:   make(chan bool),
 		clients: make(map[*Client]bool),
 	}
 	go func() {
@@ -47,6 +51,12 @@ func newRoom() *Room {
 						c.Stop()
 						delete(r.clients, c)
 					}
+				}
+			case <-r.Purge:
+				log.Printf("Purge all clients")
+				for c := range r.clients {
+					c.Stop()
+					delete(r.clients, c)
 				}
 			}
 		}
@@ -92,8 +102,8 @@ func (c *Client) Send(msg string) error {
 	select {
 	case c.send <- msg:
 		return nil
+	// room goroutine が速すぎて send が間に合ってないだけかもしれないので、少しは待つ
 	case <-time.After(time.Millisecond * 10):
-		// room goroutine が速すぎて send が間に合ってないだけかもしれないので、少しは待つ
 		return errors.New("Can't send to client")
 	}
 }
@@ -119,6 +129,7 @@ func (c *Client) sender() {
 	for {
 		select {
 		case <-c.stop:
+			//log.Println("sender: Received stop")
 			return
 		case msg := <-c.send:
 			//log.Printf("sender: %#v", msg)
@@ -166,13 +177,21 @@ func main() {
 		log.Fatal(err)
 	}
 
-	for {
-		conn, err := l.AcceptTCP()
-		if err != nil {
-			log.Println(err)
-			conn.Close()
-			continue
+	go func() {
+		for {
+			conn, err := l.AcceptTCP()
+			if err != nil {
+				log.Println(err)
+				conn.Close()
+				continue
+			}
+			room.Join <- newClient(room, conn)
 		}
-		room.Join <- newClient(room, conn)
+	}()
+
+	sigint := make(chan os.Signal, 1)
+	signal.Notify(sigint, os.Interrupt)
+	for _ = range sigint {
+		room.Purge <- true
 	}
 }
