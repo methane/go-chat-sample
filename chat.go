@@ -129,7 +129,8 @@ func newClient(r *Room, conn *net.TCPConn) *Client {
 		recv:   r.Recv,
 		closed: r.Closed,
 		// クライアントは一時的に接続が不安定になるかもしれないのでバッファ多め
-		send: make(chan string, 50),
+		// CHAT_LOG_LENGTH 以上なら、ログイン後の sendLog がすぐ終わることを保障できる.
+		send: make(chan string, CHAT_LOG_LENGTH+1),
 		stop: make(chan bool),
 		conn: conn,
 	}
