@@ -242,8 +242,11 @@ func main() {
 			conn, err := l.AcceptTCP()
 			if err != nil {
 				log.Println(err)
-				conn.Close()
-				continue
+				if nerr, ok := err.(net.Error); ok && nerr.Temporary() {
+					continue
+				}
+				l.Close()
+				return
 			}
 			room.Join <- newClient(room, conn)
 		}
@@ -256,6 +259,7 @@ func main() {
 		case syscall.SIGUSR1:
 			room.Purge <- true
 		case syscall.SIGTERM, os.Interrupt:
+			l.Close()
 			room.Stop <- true
 			// 全ての client の sender を待つ
 			clientWait.Wait()
