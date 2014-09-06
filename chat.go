@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"log"
@@ -10,17 +11,20 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
-	"time"
 )
 
+const CHAT_LINE_SIZE = 512
+const CHAT_LOG_LENGTH = 100
+const SEND_BUFFER_SIZE = 4 * 1024 * 1024
+
+var BufferFull error = errors.New("Buffer full")
+
 type Room struct {
-	Join   chan *Client
-	Closed chan *Client
-	// reader をスムースに動かしても room や sender が間に合わないと仕方がない.
-	// unbuffered chan を使って入力を制限する.
-	Recv  chan string // received message from clients.
-	Purge chan bool
-	Stop  chan bool
+	Join   chan *Client // new clients
+	Closed chan *Client // leaved clients
+	Recv   chan string  // received message from clients.
+	Purge  chan bool    // kick all clients in this room.
+	Stop   chan bool    // close this room.
 	// slice の resize コストが接続数に比例して増えるのを防ぐため map を使う.
 	clients map[*Client]bool
 	log     []string
@@ -38,8 +42,6 @@ func newRoom() *Room {
 	go r.run()
 	return r
 }
-
-const CHAT_LOG_LENGTH = 100
 
 func (r *Room) run() {
 	defer log.Println("Room closed.")
@@ -105,12 +107,14 @@ func (r *Room) purge() {
 }
 
 type Client struct {
-	id     int
-	recv   chan string
-	closed chan *Client
-	send   chan string
-	stop   chan bool
-	conn   *net.TCPConn
+	m       sync.Mutex
+	id      int
+	recv    chan string
+	closed  chan *Client
+	conn    *net.TCPConn
+	stop    bool
+	cond    sync.Cond
+	sendBuf *bytes.Buffer
 }
 
 func (c *Client) String() string {
@@ -125,15 +129,15 @@ func newClient(r *Room, conn *net.TCPConn) *Client {
 	// lastClientId のせいでこの関数はスレッドセーフじゃないよごめん
 	lastClientId++
 	cl := &Client{
-		id:     lastClientId,
-		recv:   r.Recv,
-		closed: r.Closed,
-		// クライアントは一時的に接続が不安定になるかもしれないのでバッファ多め
-		// CHAT_LOG_LENGTH 以上なら、ログイン後の sendLog がすぐ終わることを保障できる.
-		send: make(chan string, CHAT_LOG_LENGTH+1),
-		stop: make(chan bool),
-		conn: conn,
+		m:       sync.Mutex{},
+		id:      lastClientId,
+		recv:    r.Recv,
+		closed:  r.Closed,
+		conn:    conn,
+		stop:    false,
+		sendBuf: &bytes.Buffer{},
 	}
+	cl.cond.L = &cl.m
 	clientWait.Add(1) // receiver の終了を待つ必要は特にないので sender 分だけ Add
 	go cl.sender()
 	go cl.receiver()
@@ -143,36 +147,23 @@ func newClient(r *Room, conn *net.TCPConn) *Client {
 
 // Send msg to the client.
 func (c *Client) Send(msg string) error {
-	// 特定のクライアントが遅いときに、全体を遅くしたくないので、 select を使って
-	// すぐに送信できない場合は諦める。
-	// ただし、 room goroutine が sender goroutine より速く回ってるためにチャンネルの
-	// バッファがいっぱいになってるだけの可能性もあるので、一定時間は待つ.
-	// バッファに空きがあるときに時に time.After を生成するのは無駄なので、 select を2段にする.
-	select {
-	case c.send <- msg:
-		return nil
-	default:
-		select {
-		case c.send <- msg:
-			return nil
-		case <-time.After(time.Millisecond * 10):
-			return errors.New("Can't send to client")
-		}
+	c.m.Lock()
+	defer c.m.Unlock()
+
+	if c.sendBuf.Len()+len(msg) > SEND_BUFFER_SIZE {
+		return BufferFull
 	}
+	c.sendBuf.WriteString(msg)
+	c.cond.Signal()
+	return nil
 }
 
 // Stop closes client.  It can be called multiple times.
 func (c *Client) Stop() {
-	// 1つのチャンネルで複数の goroutine を止められるように、メッセージ送信じゃなくて
-	// close を使う。
-	// (このサンプルプログラムでは stop 受信してるのは1箇所だけなのでメッセージ送信でも可)
-	// ちなみに defer recover() ではダメ
-	defer func() {
-		if r := recover(); r != nil {
-			log.Println(r)
-		}
-	}()
-	close(c.stop)
+	c.m.Lock()
+	c.stop = true
+	c.m.Unlock()
+	c.cond.Signal()
 }
 
 func (c *Client) sender() {
@@ -184,29 +175,36 @@ func (c *Client) sender() {
 		clientWait.Done()
 		c.closed <- c
 	}()
+
+	buf := &bytes.Buffer{}
+
+	c.m.Lock()
 	for {
-		select {
-		case <-c.stop:
-			//log.Println("sender: Received stop")
+		if c.stop {
 			return
-		case msg := <-c.send:
-			//log.Printf("sender: %#v", msg)
-			_, err := c.conn.Write([]byte(msg))
-			// net.Error.Temporary() をハンドルする必要は多分ない.
-			// 書き込みできたバイト数が len(msg) より小さい場合は必ず err != nil なので、
-			// Write() の第一戻り値は無視してエラーハンドリングだけを行う
-			if err != nil {
-				log.Println(err)
-				return
-			}
 		}
+		if c.sendBuf.Len() == 0 {
+			c.cond.Wait()
+			continue
+		}
+		// swap & unlock で room を待たせない
+		buf, c.sendBuf = c.sendBuf, buf
+		c.m.Unlock()
+
+		_, err := c.conn.Write(buf.Bytes())
+		if err != nil {
+			log.Println(c, err)
+			return
+		}
+		buf.Reset()
+		c.m.Lock()
 	}
 }
 
 func (c *Client) receiver() {
 	defer c.Stop() // receiver が止まるときはかならず全体を止める.
 	// 1行を512byteに制限する.
-	reader := bufio.NewReaderSize(c.conn, 512)
+	reader := bufio.NewReaderSize(c.conn, CHAT_LINE_SIZE)
 	for {
 		// Read() する goroutine を中断するのは難しい。
 		// 外側で conn.Close() して、エラーで死ぬのが楽.
@@ -242,8 +240,8 @@ func main() {
 			conn, err := l.AcceptTCP()
 			if err != nil {
 				log.Println(err)
-				conn.Close()
-				continue
+				l.Close()
+				return
 			}
 			room.Join <- newClient(room, conn)
 		}
@@ -256,6 +254,7 @@ func main() {
 		case syscall.SIGUSR1:
 			room.Purge <- true
 		case syscall.SIGTERM, os.Interrupt:
+			l.Close()
 			room.Stop <- true
 			// 全ての client の sender を待つ
 			clientWait.Wait()
